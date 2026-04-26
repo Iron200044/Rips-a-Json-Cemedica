@@ -1,23 +1,19 @@
 # ============================================================
-#  CONSULTAS SQL — Extracción de datos desde SIGO/GCE
-#  Basado en el schema real de la BD (script_prueba.sql)
+#  CONSULTAS SQL — Esquema real GCEV2
 # ============================================================
-
 import pyodbc
 from config import DB
-from fevrips.logger import log
+from logger import log
 
 
 def conectar():
-    """Abre la conexión a SQL Server. Retorna el objeto connection."""
     conn_str = (
         f"DRIVER={{{DB['driver']}}};"
         f"SERVER={DB['server']},{DB['port']};"
         f"DATABASE={DB['database']};"
         f"UID={DB['username']};"
         f"PWD={DB['password']};"
-        "TrustServerCertificate=yes;"
-        "Encrypt=no;"
+        "TrustServerCertificate=yes;Encrypt=no;"
     )
     try:
         conn = pyodbc.connect(conn_str, timeout=30)
@@ -30,16 +26,14 @@ def conectar():
 
 def obtener_facturas_pendientes(conn, fecha_desde=None, fecha_hasta=None, num_factura=None):
     """
-    Retorna lista de facturas de GCEFACTURA que aún no tienen CUV
-    y tienen paciente + aseguradora asociados.
-
-    Parámetros opcionales:
-      fecha_desde / fecha_hasta : filtrar por rango de fechas (datetime)
-      num_factura               : buscar una factura específica
+    GCEFACTURA + GCEPACIENTE + GCEASEGURA + GCEMEDICO
+    Joins confirmados del esquema:
+      GCEFACTURA.PacCodigoF → GCEPACIENTE.PacCodigo
+      GCEFACTURA.AseIdAsegF → GCEASEGURA.AseIdAseg
+      GCEFACTURA.MedCodF    → GCEMEDICO.MedCod
     """
     where_extra = ""
     params = []
-
     if num_factura:
         where_extra += " AND f.FacNumero = ?"
         params.append(num_factura)
@@ -58,9 +52,9 @@ def obtener_facturas_pendientes(conn, fecha_desde=None, fecha_hasta=None, num_fa
         f.FacFechaF,
         f.FacEstado,
         f.FacTotal,
-        f.PacCodigoF,
+        f.CmIdCentroF,
 
-        -- Datos del paciente
+        p.PacCodigo,
         p.PacTipId,
         p.PacNumId,
         p.PacPriNom,
@@ -70,175 +64,217 @@ def obtener_facturas_pendientes(conn, fecha_desde=None, fecha_hasta=None, num_fa
         p.PacFecNac,
         p.PacGenero,
         p.PacZona,
-        p.TgPaCodigo,     -- código país
-        p.TgDpCodigo,     -- código departamento
-        p.TgCiCodigo,     -- código ciudad/municipio
+        p.TgPaCodigo,
+        p.TgDpCodigo,
+        p.TgCiCodigo,
 
-        -- Datos de la aseguradora
+        a.AseIdAseg,
         a.AseNombre,
-        a.AseNumId        AS AseNit,
-        a.AseTipoUsuRips  AS TipoUsuario,
-        a.AseCodRips      AS CoberturaPlan
+        a.AseNumId       AS AseNit,
+        a.AseTipId       AS AseTipoId,
+        a.AseCodRips     AS CoberturaPlan,
+        a.AseTipoUsuRips AS TipoUsuario,
+        a.AseNomRIPs     AS AseNombreRips,
+
+        m.MedTipId,
+        m.MedNumId
 
     FROM GCEFACTURA f
-    INNER JOIN GCEPACIENTE  p ON p.PacCodigo = f.PacCodigoF
-    LEFT  JOIN GCEASEGURA   a ON a.AseIdAseg = f.AseIdAsegF
-    WHERE f.FacEstado = 'A'   -- 'A' = Activa/Aprobada. TODO: confirmar código de estado
+    INNER JOIN GCEPACIENTE p ON p.PacCodigo = f.PacCodigoF
+    LEFT  JOIN GCEASEGURA  a ON a.AseIdAseg = f.AseIdAsegF
+    LEFT  JOIN GCEMEDICO   m ON m.MedCod    = f.MedCodF
+    WHERE f.FacEstado = 'A'
       {where_extra}
     ORDER BY f.FacFecha ASC
     """
     cursor = conn.cursor()
     cursor.execute(sql, params)
-    columnas = [col[0] for col in cursor.description]
-    return [dict(zip(columnas, row)) for row in cursor.fetchall()]
+    cols = [c[0] for c in cursor.description]
+    return [dict(zip(cols, row)) for row in cursor.fetchall()]
 
 
 def obtener_consultas_factura(conn, num_factura, pac_num_id):
     """
-    Retorna las consultas médicas de una factura desde GCERIPSCONSULTA.
-    Incluye diagnósticos desde GCEHCDX (a través de la historia).
+    GCERIPSCONSULTA + GCESERVICIO + GCEAGENDA + GCEMEDICO
+    Joins confirmados:
+      GCERIPSCONSULTA.RCFacNum  → GCEFACTURA.FacNumero
+      GCERIPSCONSULTA.RPacNumId → GCEPACIENTE.PacNumId
+      GCERIPSCONSULTA.RSvCodigo → GCESERVICIO.SvCodigo
+      GCERIPSCONSULTA.RAgIdAge  → GCEAGENDA.AgIdAge
+      GCEAGENDA.MedCod          → GCEMEDICO.MedCod
     """
     sql = """
     SELECT
-        rc.RAgeFechaC        AS FechaAtencion,
-        rc.RAgeVolante       AS NumAutorizacion,
-        rc.RSvCodigo         AS CodCUPS,
-        rc.RCeCodigo         AS CodEspecialidad,
-        rc.RValor            AS ValorServicio,
-        rc.RDx1              AS DiagPrincipal,
-        rc.RDx2              AS DiagRelacionado1,
-        rc.RDx3              AS DiagRelacionado2,
-        rc.RTipoDx           AS TipoDiagnostico,
-        rc.RAgIdAge          AS IdAgenda,
+        rc.RAgeFechaC  AS FechaAtencion,
+        rc.RAgeVolante AS NumAutorizacion,
+        rc.RSvCodigo   AS CodCUPS,
+        rc.RCeCodigo   AS CodEspecialidad,
+        rc.RValor      AS ValorServicio,
+        rc.RDx1        AS DiagPrincipal,
+        rc.RDx2        AS DiagRelacionado1,
+        rc.RDx3        AS DiagRelacionado2,
+        rc.RTipoDx     AS TipoDiagnostico,
 
-        -- Servicio: descripción y clase
-        sv.SvDescrip         AS NombreServicio,
-        sv.SvClase           AS ClaseServicio,
-        sv.SvSubClase        AS SubclaseServicio,
+        sv.SvDescrip   AS NombreServicio,
+        sv.SvClase     AS ClaseServicio,
+        sv.SvSubClase  AS SubclaseServicio,
 
-        -- Datos del médico desde la agenda/historia
-        -- TODO: ajustar join si la IPS usa otra tabla para médico tratante
-        ag.MedCod            AS CodMedico
+        ag.AgVolante   AS AgVolante,
+        ag.AgPlan      AS AgPlan,
+
+        m.MedTipId     AS MedTipId,
+        m.MedNumId     AS MedNumId
 
     FROM GCERIPSCONSULTA rc
     LEFT JOIN GCESERVICIO sv ON sv.SvCodigo = rc.RSvCodigo
     LEFT JOIN GCEAGENDA   ag ON ag.AgIdAge  = rc.RAgIdAge
-    WHERE rc.RCFacNum   = ?
-      AND rc.RPacNumId  = ?
+    LEFT JOIN GCEMEDICO    m ON m.MedCod    = ag.MedCod
+    WHERE rc.RCFacNum  = ?
+      AND rc.RPacNumId = ?
     ORDER BY rc.RAgeFechaC ASC
     """
     cursor = conn.cursor()
     cursor.execute(sql, [num_factura, pac_num_id])
-    columnas = [col[0] for col in cursor.description]
-    return [dict(zip(columnas, row)) for row in cursor.fetchall()]
+    cols = [c[0] for c in cursor.description]
+    return [dict(zip(cols, row)) for row in cursor.fetchall()]
 
 
 def obtener_procedimientos_factura(conn, num_factura, pac_num_id):
     """
-    Retorna los procedimientos de una factura desde GCERIPSPROCEDIM.
+    GCERIPSPROCEDIM + GCESERVICIO + GCEAGENDA + GCEMEDICO
+    Joins confirmados:
+      GCERIPSPROCEDIM.RPNumFac    → GCEFACTURA.FacNumero
+      GCERIPSPROCEDIM.RPPacNumId  → GCEPACIENTE.PacNumId
+      GCERIPSPROCEDIM.RPSvCodigo  → GCESERVICIO.SvCodigo
+      GCERIPSPROCEDIM.RPAgIdAge   → GCEAGENDA.AgIdAge
     """
     sql = """
     SELECT
-        rp.RPAgeFechaC       AS FechaAtencion,
-        rp.RPAgeVolante      AS NumAutorizacion,
-        rp.RPSvCodigo        AS CodCUPS,
-        rp.RPCeCodigo        AS CodEspecialidad,
-        rp.RPValor           AS ValorServicio,
-        rp.RPDx1             AS DiagPrincipal,
-        rp.RPDx2             AS DiagRelacionado1,
-        rp.RPDx3             AS DiagRelacionado2,
-        rp.RPTipoDx          AS TipoDiagnostico,
-        rp.RPAgIdAge         AS IdAgenda,
+        rp.RPAgeFechaC  AS FechaAtencion,
+        rp.RPAgeVolante AS NumAutorizacion,
+        rp.RPSvCodigo   AS CodCUPS,
+        rp.RPCeCodigo   AS CodEspecialidad,
+        rp.RPValor      AS ValorServicio,
+        rp.RPDx1        AS DiagPrincipal,
+        rp.RPDx2        AS DiagRelacionado1,
+        rp.RPDx3        AS DiagRelacionado2,
+        rp.RPTipoDx     AS TipoDiagnostico,
 
-        sv.SvDescrip         AS NombreServicio,
-        sv.SvClase           AS ClaseServicio
+        sv.SvDescrip    AS NombreServicio,
+        sv.SvClase      AS ClaseServicio,
+
+        ag.AgVolante    AS AgVolante,
+
+        m.MedTipId      AS MedTipId,
+        m.MedNumId      AS MedNumId
 
     FROM GCERIPSPROCEDIM rp
     LEFT JOIN GCESERVICIO sv ON sv.SvCodigo = rp.RPSvCodigo
+    LEFT JOIN GCEAGENDA   ag ON ag.AgIdAge  = rp.RPAgIdAge
+    LEFT JOIN GCEMEDICO    m ON m.MedCod    = ag.MedCod
     WHERE rp.RPNumFac   = ?
       AND rp.RPPacNumId = ?
     ORDER BY rp.RPAgeFechaC ASC
     """
     cursor = conn.cursor()
     cursor.execute(sql, [num_factura, pac_num_id])
-    columnas = [col[0] for col in cursor.description]
-    return [dict(zip(columnas, row)) for row in cursor.fetchall()]
+    cols = [c[0] for c in cursor.description]
+    return [dict(zip(cols, row)) for row in cursor.fetchall()]
 
 
 def obtener_medicamentos_factura(conn, num_factura, pac_num_id):
     """
-    Retorna medicamentos de GCEHCMEDICAMENTOS asociados a la historia
-    cuya atención está en la factura indicada.
-
-    TODO: Confirmar el join correcto entre la factura y la historia clínica
-    en el sistema SIGO de esta IPS específica. La relación puede pasar
-    por GCEFACTSERV → GCEAGENDA → GCEHCHISTORIA.
+    GCEFACTSERV → GCEPACIENTE → GCEHCHISTORIA → GCEHCMEDICAMENTOS
+                                               → GCEMEDICAMENTO → GCEMEDICAMUNDM
+                                               → GCEHCDX (HcDxClase='P')
+                                               → GCEMEDICO
+    Joins confirmados:
+      GCEFACTSERV.RfFacNumero  → GCEFACTURA.FacNumero
+      GCEFACTSERV.RfPacNumId   → GCEPACIENTE.PacNumId
+      GCEHCMEDICAMENTOS.MdCodigo → GCEMEDICAMENTO.MdCodigo
+      GCEMEDICAMENTO.MdUndMed    → GCEMEDICAMUNDM.MdUndMed
+    Nota: GCEFACTSERV no tiene valor unitario en el esquema.
     """
     sql = """
     SELECT
-        fs.RfFechaServ       AS FechaDispensa,
-        fs.RfSvCodigo        AS CodMedicamento,
-        sv.SvDescrip         AS NombreMedicamento,
-        fs.RfCantidad        AS Cantidad,
-
-        -- TODO: agregar valor unitario y total cuando se confirme la columna
-        -- fs.RfValorUnit    AS ValorUnitario,
-
-        -- Diagnóstico principal: viene de la historia clínica
-        -- TODO: confirmar join a GCEHCMEDICAMENTOS si la IPS lo usa
-        NULL                 AS DiagPrincipal,
-        NULL                 AS TipoMedicamento,   -- 01=Pos, 02=NoPBS, etc.
-        NULL                 AS Concentracion,
-        NULL                 AS UnidadMedida,
-        NULL                 AS DiasTratemiento
+        hm.MdCodigo      AS CodMedicamento,
+        md.MdDescripcion AS NombreMedicamento,
+        md.MdConcentra   AS Concentracion,
+        md.Mdpos         AS EsPOS,
+        hm.MedCant       AS Cantidad,
+        hm.MedPresc      AS Prescripcion,
+        um.MdUndDesc     AS UnidadMedida,
+        h.HcFechaIng     AS FechaDispensa,
+        h.HcIdHisto      AS IdHistoria,
+        dx.DxCodigo      AS DiagPrincipal,
+        me.MedTipId      AS MedTipId,
+        me.MedNumId      AS MedNumId
 
     FROM GCEFACTSERV fs
-    LEFT JOIN GCESERVICIO sv ON sv.SvCodigo = fs.RfSvCodigo
+    INNER JOIN GCEPACIENTE      pac ON pac.PacNumId    = fs.RfPacNumId
+    INNER JOIN GCEHCHISTORIA      h ON h.PacCodigo     = pac.PacCodigo
+    INNER JOIN GCEHCMEDICAMENTOS hm ON hm.HcIdHisto    = h.HcIdHisto
+    LEFT  JOIN GCEMEDICAMENTO    md ON md.MdCodigo     = hm.MdCodigo
+    LEFT  JOIN GCEMEDICAMUNDM    um ON um.MdUndMed     = md.MdUndMed
+    LEFT  JOIN GCEHCDX           dx ON dx.HcIdHisto    = h.HcIdHisto
+                                    AND dx.HcDxClase   = 'P'
+    LEFT  JOIN GCEMEDICO         me ON me.MedCod       = h.MedCodH
     WHERE fs.RfFacNumero = ?
       AND fs.RfPacNumId  = ?
-    ORDER BY fs.RfFechaServ ASC
-    """
-    cursor = conn.cursor()
-    cursor.execute(sql, [num_factura, pac_num_id])
-    columnas = [col[0] for col in cursor.description]
-    return [dict(zip(columnas, row)) for row in cursor.fetchall()]
-
-
-def obtener_hospitalizaciones_factura(conn, num_factura, pac_num_id):
-    """
-    Retorna hospitalizaciones desde GCEHCHISTORIA para facturas
-    con tipo de historia de hospitalización (hctipoHis = 'H' o similar).
-
-    TODO: confirmar el valor de hctipoHis que usa esta IPS para hospitalización.
-    """
-    sql = """
-    SELECT
-        h.HcIdHisto          AS IdHistoria,
-        h.HcFechaIng         AS FechaIngreso,
-        h.HcFechaEgr         AS FechaEgreso,
-        h.HcEstado           AS Estado,
-        h.HcCondUsua         AS CondicionUsuario,
-        h.hctipoHis          AS TipoHistoria,
-        h.CexCodigo          AS CausaExterna,
-
-        -- Diagnósticos de la hospitalización
-        dx.DxCodigo          AS CodDiagnostico,
-        dx.HcDxClase         AS ClaseDx,   -- 'P'=Principal, 'R'=Relacionado
-        dx.HcDxTp            AS TipoDx,
-
-        -- Médico tratante
-        h.MedCodH            AS CodMedico
-
-    FROM GCEHCHISTORIA h
-    INNER JOIN GCEHCDX dx ON dx.HcIdHisto = h.HcIdHisto
-    -- TODO: confirmar join con factura. Puede ser via GCEAGENDA o GCEFACTSERV
-    WHERE h.PacCodigo = (
-        SELECT PacCodigoF FROM GCEFACTURA WHERE FacNumero = ?
-    )
-      AND h.hctipoHis = 'H'   -- TODO: confirmar código de hospitalización
     ORDER BY h.HcFechaIng ASC
     """
     cursor = conn.cursor()
-    cursor.execute(sql, [num_factura])
-    columnas = [col[0] for col in cursor.description]
-    return [dict(zip(columnas, row)) for row in cursor.fetchall()]
+    cursor.execute(sql, [num_factura, pac_num_id])
+    cols = [c[0] for c in cursor.description]
+    return [dict(zip(cols, row)) for row in cursor.fetchall()]
+
+
+def obtener_hospitalizaciones_factura(conn, pac_num_id):
+    """
+    GCEHCHISTORIA + GCEHCDX + GCEMEDICO para hctipoHis = 'H'
+    Joins confirmados:
+      GCEHCHISTORIA.PacCodigo  → GCEPACIENTE.PacCodigo
+      GCEHCHISTORIA.MedCodH    → GCEMEDICO.MedCod
+      GCEHCDX.HcIdHisto        → GCEHCHISTORIA.HcIdHisto
+        HcDxClase='P' → principal, 'R' → relacionado
+    TODO: confirmar valor de hctipoHis para hospitalización en esta IPS.
+    """
+    sql = """
+    SELECT
+        h.HcIdHisto    AS IdHistoria,
+        h.HcFechaIng   AS FechaIngreso,
+        h.HcFechaEgr   AS FechaEgreso,
+        h.HcEstado     AS Estado,
+        h.HcCondUsua   AS CondicionUsuario,
+        h.hctipoHis    AS TipoHistoria,
+        h.CexCodigo    AS CausaExterna,
+        h.HcPriCon     AS PrimeraVez,
+        dx.DxCodigo    AS CodDiagnostico,
+        dx.HcDxClase   AS ClaseDx,
+        dx.HcDxTp      AS TipoDx,
+        m.MedTipId     AS MedTipId,
+        m.MedNumId     AS MedNumId
+
+    FROM GCEHCHISTORIA h
+    INNER JOIN GCEPACIENTE pac ON pac.PacCodigo = h.PacCodigo
+    LEFT  JOIN GCEHCDX     dx  ON dx.HcIdHisto  = h.HcIdHisto
+    LEFT  JOIN GCEMEDICO    m  ON m.MedCod      = h.MedCodH
+    WHERE pac.PacNumId = ?
+      AND h.hctipoHis  = 'H'
+    ORDER BY h.HcFechaIng ASC
+    """
+    cursor = conn.cursor()
+    cursor.execute(sql, [pac_num_id])
+    cols = [c[0] for c in cursor.description]
+    return [dict(zip(cols, row)) for row in cursor.fetchall()]
+
+
+def obtener_divipola(tg_dp_codigo, tg_ci_codigo):
+    """
+    Construye código DIVIPOLA de 5 dígitos desde TgDpCodigo + TgCiCodigo.
+    TGCIUDAD no tiene columna DIVIPOLA directa — se arma por concatenación.
+    TODO: validar contra tabla oficial si hay discrepancias.
+    """
+    if tg_dp_codigo and tg_ci_codigo:
+        return f"{int(tg_dp_codigo):02d}{int(tg_ci_codigo):03d}"
+    return None
